@@ -1,0 +1,54 @@
+module.exports = {
+  // Plans
+  PLANS: {
+    FREE: 'FREE',
+    PRO: 'PRO',
+    PRO_PLUS: 'PRO_PLUS',
+  },
+
+  // Stages
+  STAGES: ['entry', 'lounge', 'dining', 'bar', 'stage'],
+  STAGE_ORDER: {
+    entry: 0,
+    lounge: 1,
+    dining: 2,
+    bar: 3,
+    stage: 4,
+  },
+
+  // Credit rules
+  CREDITS: {
+    FREE_INITIAL: parseInt(process.env.FREE_PLAN_CREDITS) || 1,
+    PRO_MONTHLY: parseInt(process.env.PRO_PLAN_CREDITS) || 3,
+    REFERRAL_BONUS: parseInt(process.env.REFERRAL_BONUS_CREDITS) || 5,
+  },
+
+  // Images per stage
+  IMAGES_PER_STAGE: 4,
+
+  // Moodboard status
+  MOODBOARD_STATUS: {
+    IN_PROGRESS: 'IN_PROGRESS',
+    COMPLETED: 'COMPLETED',
+    FAILED: 'FAILED',
+  },
+
+  // Error codes
+  ERROR_CODES: {
+    UNAUTHORIZED: 'UNAUTHORIZED',
+    FORBIDDEN: 'FORBIDDEN',
+    NOT_FOUND: 'NOT_FOUND',
+    VALIDATION_ERROR: 'VALIDATION_ERROR',
+    INSUFFICIENT_CREDITS: 'INSUFFICIENT_CREDITS',
+    PLAN_UPGRADE_REQUIRED: 'PLAN_UPGRADE_REQUIRED',
+    AI_SERVICE_ERROR: 'AI_SERVICE_ERROR',
+    AI_TIMEOUT: 'AI_TIMEOUT',
+    INVALID_STAGE: 'INVALID_STAGE',
+    STAGE_NOT_COMPLETE: 'STAGE_NOT_COMPLETE',
+    DUPLICATE_REQUEST: 'DUPLICATE_REQUEST',
+    INVALID_IMAGE: 'INVALID_IMAGE',
+    SERVER_ERROR: 'SERVER_ERROR',
+    INVITE_CODE_INVALID: 'INVITE_CODE_INVALID',
+    INVITE_CODE_ALREADY_USED: 'INVITE_CODE_ALREADY_USED',
+  },
+};
