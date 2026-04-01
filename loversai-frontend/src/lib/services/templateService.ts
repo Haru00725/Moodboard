@@ -4,10 +4,11 @@
  */
 
 import api from "@/lib/apiClient";
+import { getLocalTemplates, LOCAL_TEMPLATES, type LocalTemplate } from "@/data/localTemplates";
 
 // ── Types ──
 
-export interface Template {
+export interface Template extends LocalTemplate {
   _id: string;
   title: string;
   theme: string;
@@ -26,13 +27,17 @@ export const getTemplates = async (params?: {
   theme?: string;
   style?: string;
 }): Promise<Template[]> => {
-  const { data } = await api.get("/templates", { params });
-  return data.data.templates ?? [];
+  // Use local templates instead of backend
+  return getLocalTemplates(params as any) as Template[];
 };
 
 export const getTemplate = async (id: string): Promise<Template> => {
-  const { data } = await api.get(`/templates/${id}`);
-  return data.data.template;
+  // Fetch from local templates
+  const template = LOCAL_TEMPLATES.find((t) => t._id === id);
+  if (!template) {
+    throw new Error("Template not found");
+  }
+  return template as Template;
 };
 
 /** Step A: initiate template purchase → get Razorpay order */

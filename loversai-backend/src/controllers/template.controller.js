@@ -63,6 +63,13 @@ const getTemplate = async (req, res, next) => {
 // ------------------------------------------------------------------
 const purchaseTemplate = async (req, res, next) => {
   try {
+    logger.info('Purchase request received', { templateId: req.params.id, userId: req.user?._id });
+
+    // Validate user
+    if (!req.user) {
+      return unauthorized(res, 'Authentication required');
+    }
+
     const template = await Template.findById(req.params.id);
     if (!template) return notFound(res, 'Template not found');
 
@@ -118,6 +125,7 @@ const purchaseTemplate = async (req, res, next) => {
       razorpayKeyId: RAZORPAY_KEY_ID,
     });
   } catch (err) {
+    logger.error('Purchase template error', { error: err.message, stack: err.stack, templateId: req.params.id });
     next(err);
   }
 };

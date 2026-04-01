@@ -39,7 +39,7 @@ const Templates: React.FC = () => {
         orderId: order.orderId,
         amount: order.amount,
         currency: order.currency || "INR",
-        name: "Lovers AI 💍",
+        name: "Lovers AI",
         description: `${selectedTemplate.title} — Premium Template`,
         prefill: {
           name: user?.name || user?.displayName || "",

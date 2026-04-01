@@ -1,4 +1,4 @@
-# 💍 LoversAI Backend
+# LoversAI Backend
 
 > AI-powered wedding moodboard generator — Production-ready Node.js/Express API
 
