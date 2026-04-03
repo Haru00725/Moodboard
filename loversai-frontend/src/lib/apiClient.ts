@@ -6,7 +6,7 @@ const API_BASE_URL =
 const api = axios.create({
   baseURL: API_BASE_URL,
   headers: { "Content-Type": "application/json" },
-  timeout: 120_000, // 120s — generous for AI generation calls
+  timeout: 300_000, // 300s — generous for multi-step Groq + Flux AI generation
 });
 
 // ── Request interceptor: attach JWT token ──

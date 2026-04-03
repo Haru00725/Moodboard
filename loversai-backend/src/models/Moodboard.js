@@ -3,7 +3,7 @@ const { STAGES, MOODBOARD_STATUS } = require('../config/constants');
 
 const stageDataSchema = new mongoose.Schema(
   {
-    images: [{ type: String }],          // generated image URLs
+    images: [{ type: mongoose.Schema.Types.Mixed }],          // generated images: {url, label} or plain URLs
     selectedImage: { type: String, default: null },
     generatedAt: { type: Date },
     prompt: { type: String },

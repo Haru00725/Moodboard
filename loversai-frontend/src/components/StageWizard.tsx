@@ -2,10 +2,33 @@ import React, { useState, useCallback, useRef } from "react";
 import { motion, AnimatePresence, Reorder } from "framer-motion";
 import { useAuth } from "@/contexts/AuthContext";
 import { useNavigate } from "react-router-dom";
-import { STAGES, generateStageImages, selectStageImage, type StageKey, type GeneratedImage } from "@/lib/services/aiService";
+import {
+  STAGES,
+  generateStageImages,
+  selectStageImage,
+  fileToBase64,
+  type StageKey,
+  type GeneratedImage,
+  type StageGenerationInputs,
+} from "@/lib/services/aiService";
 import { saveMoodboard, addLogo, downloadMoodboard } from "@/lib/services/databaseService";
-import { Sparkles, RefreshCw, ChevronRight, Check, Save, Image as ImageIcon, Download, Upload, FileText, Presentation, GripVertical } from "lucide-react";
+import {
+  Sparkles,
+  RefreshCw,
+  ChevronRight,
+  Check,
+  Save,
+  Image as ImageIcon,
+  Download,
+  Upload,
+  FileText,
+  Presentation,
+  GripVertical,
+  Camera,
+  Palette,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { toast } from "@/hooks/use-toast";
 import {
   Dialog,
@@ -28,7 +51,25 @@ interface StageWizardProps {
   onClose: () => void;
 }
 
-// ── Image Card — renders real image or fallback ──
+// ── Selection pill ──
+const Pill: React.FC<{
+  label: string;
+  selected: boolean;
+  onClick: () => void;
+}> = ({ label, selected, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`px-3 py-1.5 rounded-full text-xs font-body transition-all border ${
+      selected
+        ? "bg-primary/15 border-primary/40 text-primary font-medium shadow-sm"
+        : "bg-muted/50 border-transparent text-muted-foreground hover:bg-muted hover:border-border"
+    }`}
+  >
+    {label}
+  </button>
+);
+
+// ── Image Card ──
 const ImageCard: React.FC<{
   image: GeneratedImage;
   selected: boolean;
@@ -49,14 +90,12 @@ const ImageCard: React.FC<{
         className="w-full h-full object-cover"
         loading="lazy"
         onError={(e) => {
-          // On error, hide image and show fallback
           (e.target as HTMLImageElement).style.display = "none";
           const fallback = (e.target as HTMLImageElement).nextElementSibling;
           if (fallback) (fallback as HTMLElement).style.display = "flex";
         }}
       />
     ) : null}
-    {/* Fallback (shown if no url or on image error) */}
     <div
       className="w-full h-full bg-gradient-to-br from-muted to-muted/50 flex flex-col items-center justify-center gap-3 p-4"
       style={{ display: image.url ? "none" : "flex" }}
@@ -69,18 +108,12 @@ const ImageCard: React.FC<{
       </span>
       <span className="text-xs text-muted-foreground font-body">{image.stageName}</span>
     </div>
-
-    {/* Hover overlay */}
     <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-all duration-300" />
-
-    {/* Label overlay */}
     {image.url && (
       <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/60 to-transparent p-3">
         <span className="text-white text-xs font-body font-medium">{image.label}</span>
       </div>
     )}
-
-    {/* Selected check */}
     {selected && (
       <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-primary flex items-center justify-center shadow-lg">
         <Check size={14} className="text-primary-foreground" />
@@ -89,7 +122,7 @@ const ImageCard: React.FC<{
   </button>
 );
 
-// ── Collage cell for drag-and-drop moodboard ──
+// ── Collage item type ──
 interface CollageItem {
   id: string;
   stageKey: string;
@@ -98,6 +131,12 @@ interface CollageItem {
   selectionLabel: string;
   imageUrl: string | null;
 }
+
+// ── Selection categories for the per-stage sidebar ──
+const FUNCTION_OPTIONS = ["Haldi", "Mehendi", "Sangeet", "Shaadi", "Reception"];
+const THEME_OPTIONS = ["Royal", "Minimal", "Boho", "Traditional", "Pastel", "Art Deco"];
+const CELEBRATION_OPTIONS = ["Palace", "Banquet", "Open Lawn", "Resort", "Beach", "Heritage Haveli"];
+const TIME_OPTIONS = ["Daytime", "Nighttime", "Golden Hour", "Twilight"];
 
 const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose }) => {
   const { user, refreshCredits } = useAuth();
@@ -115,8 +154,19 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
   const [collageItems, setCollageItems] = useState<CollageItem[]>([]);
   const [genError, setGenError] = useState<string | null>(null);
 
+  // ── Per-stage inputs ──
+  const [stageVenueFile, setStageVenueFile] = useState<File | null>(null);
+  const [stageDecorFile, setStageDecorFile] = useState<File | null>(null);
+  const [stageFunctionType, setStageFunctionType] = useState(options.function || "");
+  const [stageTheme, setStageTheme] = useState(options.theme || "");
+  const [stageCelebration, setStageCelebration] = useState(options.celebration || "");
+  const [stageTime, setStageTime] = useState(options.time || "");
+  const [stageVibe, setStageVibe] = useState(options.vibe || "");
+
+  const venueInputRef = useRef<HTMLInputElement>(null);
+  const decorInputRef = useRef<HTMLInputElement>(null);
+
   const currentStage = STAGES[currentStageIdx];
-  const isFirstStage = currentStageIdx === 0;
 
   const handleGenerate = useCallback(async () => {
     setGenerating(true);
@@ -125,10 +175,29 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
     setGenError(null);
 
     try {
-      const result = await generateStageImages(
-        moodboardId,
-        currentStage.key as StageKey
-      );
+      // Convert files to base64 if present
+      let venueBase64: string | null = null;
+      let decorBase64: string | null = null;
+
+      if (stageVenueFile) {
+        venueBase64 = await fileToBase64(stageVenueFile);
+      }
+      if (stageDecorFile) {
+        decorBase64 = await fileToBase64(stageDecorFile);
+      }
+
+      const inputs: StageGenerationInputs = {
+        stage: currentStage.key as StageKey,
+        venueImageBase64: venueBase64,
+        decorImageBase64: decorBase64,
+        functionType: stageFunctionType,
+        theme: stageTheme,
+        celebrationType: stageCelebration,
+        timeOfDay: stageTime,
+        vibeDescription: stageVibe,
+      };
+
+      const result = await generateStageImages(moodboardId, inputs);
       setStageImages(result.images);
       if (result.images.length === 0) {
         setGenError("No images were generated. Please try again.");
@@ -140,18 +209,9 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
     }
 
     setGenerating(false);
-  }, [currentStage, moodboardId]);
-
-  // Auto-generate on mount or stage change
-  React.useEffect(() => {
-    if (!completed) handleGenerate();
-  }, [currentStageIdx]); // eslint-disable-line
+  }, [currentStage, moodboardId, stageVenueFile, stageDecorFile, stageFunctionType, stageTheme, stageCelebration, stageTime, stageVibe]);
 
   const handleRetry = async () => {
-    if ((user?.credits ?? 0) <= 0) {
-      toast({ title: "No Credits", description: "Upgrade your plan to retry.", variant: "destructive" });
-      return;
-    }
     handleGenerate();
   };
 
@@ -173,11 +233,13 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
 
     if (currentStageIdx < STAGES.length - 1) {
       const nextIdx = currentStageIdx + 1;
-      if (nextIdx >= 1 && user?.plan === "FREE") {
-        setShowPaywall(true);
-        return;
-      }
       setCurrentStageIdx(nextIdx);
+      // Reset per-stage files for the next stage (keep selections persisted)
+      setStageVenueFile(null);
+      setStageDecorFile(null);
+      setStageImages([]);
+      setSelectedImage(null);
+      setGenError(null);
     } else {
       // Build collage items from selections
       const items: CollageItem[] = STAGES.map((stage) => {
@@ -265,9 +327,7 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
                 3: { gridColumn: "4 / 5", gridRow: "2 / 3" },
                 4: { gridColumn: "1 / 5", gridRow: "3 / 4" },
               };
-
               const isHero = idx === 0;
-
               return (
                 <Reorder.Item
                   key={item.id}
@@ -287,7 +347,6 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
                     shadow-lg shadow-black/5 hover:shadow-xl hover:shadow-lovers-blush/10
                     transition-all duration-300 relative
                   `}>
-                    {/* Real Image */}
                     {item.imageUrl ? (
                       <img
                         src={item.imageUrl}
@@ -305,8 +364,6 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
                         </span>
                       </div>
                     )}
-
-                    {/* Overlay with Stage Badge */}
                     <div className="absolute top-0 left-0 right-0 p-2.5 flex items-start justify-between">
                       <div className="px-3 py-1 rounded-full text-[10px] font-body font-semibold uppercase tracking-wider bg-black/30 text-white backdrop-blur-sm">
                         {item.stageIcon} {item.stageLabel}
@@ -315,16 +372,12 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
                         <GripVertical size={16} className="text-white" />
                       </div>
                     </div>
-
-                    {/* Shimmer */}
                     <div className="absolute inset-0 rounded-2xl opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none bg-gradient-to-tr from-transparent via-white/10 to-transparent" />
                   </div>
                 </Reorder.Item>
               );
             })}
           </Reorder.Group>
-
-          {/* Logo */}
           {logoUrl && (
             <div className="mt-5 flex justify-center">
               <img src={logoUrl} alt="Company logo" className="h-12 object-contain opacity-80" />
@@ -341,7 +394,6 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
             <Save size={16} className="mr-2" />
             Save Moodboard
           </Button>
-
           <div>
             <input
               type="file"
@@ -359,7 +411,6 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
               {logoFile ? "Change Logo" : "Add Company Logo"}
             </Button>
           </div>
-
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" className="glass font-body">
@@ -378,7 +429,6 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-
           <Button variant="ghost" onClick={onClose} className="font-body text-muted-foreground">
             Start Over
           </Button>
@@ -388,10 +438,10 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
   }
 
   // ════════════════════════════════════════════
-  // WIZARD: Stage-by-stage generation
+  // WIZARD: Stage-by-stage generation with per-stage inputs
   // ════════════════════════════════════════════
   return (
-    <div className="w-full max-w-3xl mx-auto space-y-6">
+    <div className="w-full max-w-5xl mx-auto space-y-6">
       {/* Stage progress */}
       <div className="flex items-center justify-center gap-1.5 flex-wrap">
         {STAGES.map((stage, idx) => (
@@ -421,125 +471,294 @@ const StageWizard: React.FC<StageWizardProps> = ({ options, moodboardId, onClose
           Stage {currentStageIdx + 1}: {currentStage.label} {currentStage.icon}
         </h3>
         <p className="text-xs text-muted-foreground font-body mt-1">
-          {isFirstStage ? "Free generation" : "Select your favorite design"}
+          Upload reference images & select options, then generate
         </p>
       </div>
 
-      <AnimatePresence mode="wait">
-        {generating ? (
-          <motion.div
-            key="loading"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="bg-white/40 dark:bg-black/30 backdrop-blur-xl border border-white/30 dark:border-gray-700/50 rounded-2xl p-8 shadow-lg"
-          >
-            <div className="grid grid-cols-2 gap-4">
-              {[1, 2, 3, 4].map((i) => (
-                <div key={i} className="aspect-square rounded-xl bg-muted overflow-hidden relative">
-                  <div
-                    className="absolute inset-0 animate-shimmer"
-                    style={{
-                      backgroundImage: "linear-gradient(90deg, transparent, hsl(var(--primary) / 0.15), transparent)",
-                      backgroundSize: "200% 100%",
-                    }}
+      <div className="flex flex-col lg:flex-row gap-6">
+        {/* ── Left: Per-stage input panel ── */}
+        <div className="w-full lg:w-[320px] shrink-0 space-y-5">
+          <div className="glass rounded-2xl p-5 space-y-4">
+            {/* Venue Image Upload */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                <Camera size={12} className="inline mr-1" /> Venue Photo
+              </label>
+              <input
+                type="file"
+                ref={venueInputRef}
+                className="hidden"
+                accept="image/*"
+                onChange={(e) => setStageVenueFile(e.target.files?.[0] || null)}
+              />
+              {stageVenueFile ? (
+                <div className="relative group">
+                  <img
+                    src={URL.createObjectURL(stageVenueFile)}
+                    alt="Venue"
+                    className="w-full h-24 object-cover rounded-lg border border-white/30"
                   />
+                  <button
+                    onClick={() => setStageVenueFile(null)}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-destructive text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    ×
+                  </button>
                 </div>
-              ))}
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full glass font-body text-xs"
+                  onClick={() => venueInputRef.current?.click()}
+                >
+                  <Upload size={14} className="mr-1.5" />
+                  Upload Venue Image
+                </Button>
+              )}
             </div>
-            <div className="flex items-center justify-center gap-2 mt-6 text-lovers-blush">
-              <Sparkles className="animate-pulse" size={16} />
-              <span className="font-body text-sm italic">Crafting {currentStage.label} designs...</span>
-            </div>
-          </motion.div>
-        ) : (
-          <motion.div
-            key="images"
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-          >
-            {/* Error state */}
-            {genError && stageImages.length === 0 && (
-              <div className="bg-destructive/10 border border-destructive/30 rounded-xl p-4 mb-4 text-center">
-                <p className="text-sm text-destructive font-body">{genError}</p>
-              </div>
-            )}
 
-            <div className="bg-white/40 dark:bg-black/30 backdrop-blur-xl border border-white/30 dark:border-gray-700/50 rounded-2xl p-6 shadow-lg">
-              <div className="grid grid-cols-2 gap-4">
-                {stageImages.map((img) => (
-                  <ImageCard
-                    key={img.id}
-                    image={img}
-                    selected={selectedImage === img.id}
-                    onClick={() => setSelectedImage(img.id)}
+            {/* Decor Reference Upload */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                <Palette size={12} className="inline mr-1" /> Decor Reference
+              </label>
+              <input
+                type="file"
+                ref={decorInputRef}
+                className="hidden"
+                accept="image/*"
+                onChange={(e) => setStageDecorFile(e.target.files?.[0] || null)}
+              />
+              {stageDecorFile ? (
+                <div className="relative group">
+                  <img
+                    src={URL.createObjectURL(stageDecorFile)}
+                    alt="Decor"
+                    className="w-full h-24 object-cover rounded-lg border border-white/30"
                   />
+                  <button
+                    onClick={() => setStageDecorFile(null)}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-destructive text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                  >
+                    ×
+                  </button>
+                </div>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full glass font-body text-xs"
+                  onClick={() => decorInputRef.current?.click()}
+                >
+                  <Upload size={14} className="mr-1.5" />
+                  Upload Decor Reference
+                </Button>
+              )}
+            </div>
+
+            {/* Vibe Description */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                Vibe Description
+              </label>
+              <Input
+                value={stageVibe}
+                onChange={(e) => setStageVibe(e.target.value)}
+                placeholder="e.g. Romantic garden with cascading florals"
+                className="bg-background/50 font-body text-sm"
+              />
+            </div>
+
+            {/* Function */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                Function
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {FUNCTION_OPTIONS.map((f) => (
+                  <Pill key={f} label={f} selected={stageFunctionType === f} onClick={() => setStageFunctionType(stageFunctionType === f ? "" : f)} />
                 ))}
               </div>
             </div>
 
-            <div className="flex flex-col items-center gap-3 mt-6">
-              {selectedImage && (
-                <Button
-                  onClick={handleNext}
-                  size="lg"
-                  className="font-body px-8 bg-lovers-blush/80 hover:bg-lovers-blush text-white border border-white/20 backdrop-blur-sm shadow-lg"
-                >
-                  <Check size={16} className="mr-2" />
-                  {currentStageIdx < STAGES.length - 1 ? "Add to Moodboard & Next" : "Complete Moodboard"}
-                </Button>
-              )}
-              <Button
-                variant="outline"
-                className="glass font-body text-sm"
-                onClick={handleRetry}
-                disabled={generating}
-              >
-                <RefreshCw size={14} className="mr-2" />
-                Retry (Uses 1 Credit)
-              </Button>
+            {/* Theme */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                Theme
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {THEME_OPTIONS.map((t) => (
+                  <Pill key={t} label={t} selected={stageTheme === t} onClick={() => setStageTheme(stageTheme === t ? "" : t)} />
+                ))}
+              </div>
             </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
-      {/* Paywall Modal */}
-      <Dialog open={showPaywall} onOpenChange={setShowPaywall}>
-        <DialogContent className="bg-white/70 dark:bg-gray-900/70 backdrop-blur-2xl border border-white/30 dark:border-gray-700/50 shadow-2xl sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle className="font-heading text-2xl flex items-center gap-2">
-              <Sparkles className="text-lovers-blush" size={22} />
-              Unlock Full Moodboard
-            </DialogTitle>
-            <DialogDescription className="font-body">
-              Stage 1 (Entry) is free! Upgrade to Pro to continue generating all 5 stages
-              of your wedding moodboard.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 mt-4">
-            <div className="bg-white/40 dark:bg-white/5 backdrop-blur-md rounded-xl p-4 space-y-2 border border-white/30 dark:border-white/10">
-              <p className="font-body font-medium text-foreground">Pro Plan — ₹999/month</p>
-              <ul className="text-sm text-muted-foreground font-body space-y-1">
-                <li>✓ 3 complete moodboard generations</li>
-                <li>✓ All 5 stages unlocked</li>
-                <li>✓ Advanced AI model</li>
-              </ul>
+            {/* Celebration Type */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                Celebration Type
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {CELEBRATION_OPTIONS.map((c) => (
+                  <Pill key={c} label={c} selected={stageCelebration === c} onClick={() => setStageCelebration(stageCelebration === c ? "" : c)} />
+                ))}
+              </div>
             </div>
-            <div className="flex gap-3">
-              <Button
-                className="flex-1 font-body bg-lovers-blush/80 hover:bg-lovers-blush text-white border border-white/20"
-                onClick={() => { navigate("/billing"); setShowPaywall(false); }}
-              >
-                Upgrade Now
-              </Button>
-              <Button variant="ghost" className="font-body" onClick={() => setShowPaywall(false)}>
-                Maybe Later
-              </Button>
+
+            {/* Time */}
+            <div>
+              <label className="text-xs font-body font-medium text-muted-foreground uppercase tracking-wider mb-1.5 block">
+                Time of Day
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {TIME_OPTIONS.map((t) => (
+                  <Pill key={t} label={t} selected={stageTime === t} onClick={() => setStageTime(stageTime === t ? "" : t)} />
+                ))}
+              </div>
             </div>
           </div>
-        </DialogContent>
-      </Dialog>
+
+          {/* Generate button */}
+          <Button
+            onClick={handleGenerate}
+            disabled={generating}
+            size="lg"
+            className="w-full font-body bg-lovers-blush/80 hover:bg-lovers-blush text-white border border-white/20 backdrop-blur-sm shadow-lg"
+          >
+            {generating ? (
+              <>
+                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2" />
+                Generating...
+              </>
+            ) : (
+              <>
+                <Sparkles size={18} className="mr-2" />
+                Generate {currentStage.label}
+              </>
+            )}
+          </Button>
+        </div>
+
+        {/* ── Right: Generated images area ── */}
+        <div className="flex-1 min-w-0">
+          <AnimatePresence mode="wait">
+            {generating ? (
+              <motion.div
+                key="loading"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="bg-white/40 dark:bg-black/30 backdrop-blur-xl border border-white/30 dark:border-gray-700/50 rounded-2xl p-8 shadow-lg"
+              >
+                <div className="grid grid-cols-2 gap-4">
+                  {[1, 2, 3, 4].map((i) => (
+                    <div key={i} className="aspect-square rounded-xl bg-muted overflow-hidden relative">
+                      <div
+                        className="absolute inset-0 animate-shimmer"
+                        style={{
+                          backgroundImage: "linear-gradient(90deg, transparent, hsl(var(--primary) / 0.15), transparent)",
+                          backgroundSize: "200% 100%",
+                        }}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div className="flex items-center justify-center gap-2 mt-6 text-lovers-blush">
+                  <Sparkles className="animate-pulse" size={16} />
+                  <span className="font-body text-sm italic">Crafting {currentStage.label} designs via AI pipeline...</span>
+                </div>
+                <p className="text-center text-xs text-muted-foreground font-body mt-2">
+                  This may take 1-3 minutes (Groq analysis + Flux generation)
+                </p>
+              </motion.div>
+            ) : stageImages.length > 0 ? (
+              <motion.div
+                key="images"
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0 }}
+              >
+                {genError && stageImages.length === 0 && (
+                  <div className="bg-destructive/10 border border-destructive/30 rounded-xl p-4 mb-4 text-center">
+                    <p className="text-sm text-destructive font-body">{genError}</p>
+                  </div>
+                )}
+
+                <div className="bg-white/40 dark:bg-black/30 backdrop-blur-xl border border-white/30 dark:border-gray-700/50 rounded-2xl p-6 shadow-lg">
+                  <div className="grid grid-cols-2 gap-4">
+                    {stageImages.map((img) => (
+                      <ImageCard
+                        key={img.id}
+                        image={img}
+                        selected={selectedImage === img.id}
+                        onClick={() => setSelectedImage(img.id)}
+                      />
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex flex-col items-center gap-3 mt-6">
+                  {selectedImage && (
+                    <Button
+                      onClick={handleNext}
+                      size="lg"
+                      className="font-body px-8 bg-lovers-blush/80 hover:bg-lovers-blush text-white border border-white/20 backdrop-blur-sm shadow-lg"
+                    >
+                      <Check size={16} className="mr-2" />
+                      {currentStageIdx < STAGES.length - 1 ? "Add to Moodboard & Next" : "Complete Moodboard"}
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    className="glass font-body text-sm"
+                    onClick={handleRetry}
+                    disabled={generating}
+                  >
+                    <RefreshCw size={14} className="mr-2" />
+                    Regenerate
+                  </Button>
+                </div>
+              </motion.div>
+            ) : (
+              <motion.div
+                key="empty"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="bg-white/40 dark:bg-black/30 backdrop-blur-xl border border-white/30 dark:border-gray-700/50 rounded-2xl p-12 shadow-lg flex flex-col items-center justify-center text-center min-h-[400px]"
+              >
+                {genError ? (
+                  <>
+                    <div className="bg-destructive/10 border border-destructive/30 rounded-xl p-4 mb-4">
+                      <p className="text-sm text-destructive font-body">{genError}</p>
+                    </div>
+                    <Button
+                      variant="outline"
+                      className="glass font-body text-sm mt-2"
+                      onClick={handleRetry}
+                    >
+                      <RefreshCw size={14} className="mr-2" />
+                      Try Again
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-20 h-20 rounded-full bg-primary/10 flex items-center justify-center mb-4">
+                      <Sparkles className="text-primary" size={32} />
+                    </div>
+                    <h4 className="font-heading text-lg text-foreground mb-2">
+                      Ready to Generate
+                    </h4>
+                    <p className="text-sm text-muted-foreground font-body max-w-sm leading-relaxed">
+                      Upload your venue & decor reference images, select your preferences on the left, then click <strong>"Generate {currentStage.label}"</strong> to create 4 AI-powered design variations.
+                    </p>
+                  </>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+      </div>
     </div>
   );
 };

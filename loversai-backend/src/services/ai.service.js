@@ -1,266 +1,750 @@
 const axios = require('axios');
+const Groq = require('groq-sdk');
 const logger = require('../utils/logger');
 
-const INFIP_BASE_URL = process.env.INFIP_BASE_URL || 'https://api.infip.pro/v1';
-const INFIP_API_KEY = process.env.INFIP_API_KEY;
-const INFIP_MODEL = process.env.INFIP_MODEL || 'img4';
-const POLL_INTERVAL_MS = parseInt(process.env.INFIP_POLL_INTERVAL_MS) || 3000;
-const MAX_RETRIES = parseInt(process.env.INFIP_MAX_RETRIES) || 5;
-const POLL_TIMEOUT_MS = parseInt(process.env.INFIP_POLL_TIMEOUT_MS) || 120000;
+// ------------------------------------------------------------------
+// Config — Groq (prompt generation via 3-stage pipeline)
+// ------------------------------------------------------------------
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_VISION_MODEL = process.env.GROQ_VISION_MODEL || 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+// ------------------------------------------------------------------
+// Config — BFL Flux (image generation)
+// ------------------------------------------------------------------
+
+const BFL_API_KEY = process.env.BFL_API_KEY;
+const FLUX_SUBMIT_URL = 'https://api.bfl.ai/v1/flux-kontext-pro';
+const FLUX_POLL_BASE = 'https://api.bfl.ai/v1/get_result';
+const FLUX_POLL_INTERVAL_MS = parseInt(process.env.FLUX_POLL_INTERVAL_MS) || 2000;
+const FLUX_POLL_TIMEOUT_MS = parseInt(process.env.FLUX_POLL_TIMEOUT_MS) || 180000;
 const IMAGES_PER_STAGE = 4;
+
+// ------------------------------------------------------------------
+// Groq client
+// ------------------------------------------------------------------
+
+const groq = new Groq({ apiKey: GROQ_API_KEY });
 
 // ------------------------------------------------------------------
 // Helpers
 // ------------------------------------------------------------------
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const getBackoffMs = (attempt) => Math.min(1000 * 2 ** attempt, 30000);
 
-const createAxiosInstance = () =>
-  axios.create({
-    baseURL: INFIP_BASE_URL,
-    timeout: 60000,
-    headers: {
-      Authorization: `Bearer ${INFIP_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
+// ------------------------------------------------------------------
+// SYSTEM PROMPT — Ultimate v6.0 + Complete Vibe Transfer
+// This is NEVER modified. Groq uses this to reason and build the
+// final action-first 4-zone prompt.
+// ------------------------------------------------------------------
+
+const SYSTEM_PROMPT = `
+You are a world-class AI Prompt Engineer specializing in photorealistic wedding decor visualization. You work as the intelligent middleware between a user's vision and the Flux-Kontext-Pro image generation model.
+
+═══════════════════════════════════════════════════════════════════════════════
+YOUR CORE MISSION
+═══════════════════════════════════════════════════════════════════════════════
+
+You receive THREE inputs:
+  1. VENUE IMAGE (Image 1) — The real venue/space to decorate
+  2. DECOR REFERENCE IMAGE (Image 2) — Inspiration decor to extract elements from
+  3. USER REQUEST (Text) — What the user wants (may be vague, specific, or partial)
+
+YOUR OUTPUT: Generate a structured analysis followed by a single, highly optimized
+ACTION-FIRST prompt paragraph (300-400 words) that instructs Flux-Kontext-Pro to
+generate a photorealistic image where ONLY the requested decor elements are seamlessly
+composited into the venue while preserving 100% venue authenticity.
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL RULE #0: FULL SCENE VISIBILITY — NOTHING GETS CUT OR HIDDEN
+═══════════════════════════════════════════════════════════════════════════════
+
+ANTI-CROPPING MANDATE:
+├─ The ENTIRE venue must be visible — floor to ceiling, wall to wall
+├─ NO decor element may extend beyond the image frame boundaries
+├─ ALL decor must fit WITHIN the visible venue space with comfortable margins
+├─ Leave at least 10-15% padding/breathing room on ALL edges of the frame
+├─ The camera framing and field of view must match the ORIGINAL venue photo exactly
+├─ If decor is tall, SCALE IT DOWN to fit — never crop the image to fit decor
+└─ If venue has a wide layout, ensure the FULL WIDTH is captured — no side cropping
+
+ANTI-OCCLUSION MANDATE:
+├─ Decor must NOT block or hide key venue architectural features
+├─ If venue has scenic background, decor must NOT fully obstruct it
+├─ Decor should COMPLEMENT the venue's visual flow, not dominate or overwhelm
+├─ Ensure foreground, mid-ground, and background layers are all distinguishable
+└─ No decor element should overlap another in a way that hides either one
+
+SIZE SCALING RULES:
+├─ Arch/Mandap height: Maximum 60-70% of venue ceiling height (NEVER taller)
+├─ Arch/Mandap width: Maximum 40-50% of venue visible width
+├─ Floral arrangements: Proportional to venue scale — use doors (7ft) or chairs (3ft)
+├─ Fabric/Drapery: Must not pool excessively on floor or bunch against ceiling
+├─ Ground-level decor: Must not cover more than 30% of visible floor area
+└─ ALL elements must have visible ground contact points (no floating objects)
+
+═══════════════════════════════════════════════════════════════════════════════
+CRITICAL RULE #1: ACTION-FIRST PROMPT ARCHITECTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+THE GOLDEN RULE FOR THE FINAL PROMPT:
+→ DECOR PLACEMENT must be the VERY FIRST sentence (start with "Place a" or "Add a")
+→ DECOR DETAILS must follow immediately
+→ PRESERVATION comes AFTER the decor is established
+→ EXCLUSIONS come at the very end
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 1: INTELLIGENT USER INTENT INTERPRETATION
+═══════════════════════════════════════════════════════════════════════════════
+
+STAGE CONTEXT MAPPING:
+┌──────────────┬─────────────────────────────────────────────────────────────┐
+│ Stage        │ Focus                                                       │
+├──────────────┼─────────────────────────────────────────────────────────────┤
+│ entry        │ Entrance arch, welcome gate, arrival pathway, name board    │
+│ lounge       │ Seating clusters, photo backdrop, floral wall, ambient nooks│
+│ dining       │ Table centerpieces, runners, chair decor, serving stations  │
+│ bar          │ Bar counter, backlit display, floral skirt, neon sign        │
+│ stage        │ Mandap/backdrop structure, throne chairs, floral columns    │
+└──────────────┴─────────────────────────────────────────────────────────────┘
+
+FUNCTION INTENT MAPPING:
+┌──────────────┬─────────────────────────────────────────────────────────────┐
+│ Function     │ Decor Intent                                                │
+├──────────────┼─────────────────────────────────────────────────────────────┤
+│ Haldi        │ Yellow/marigold palette, turmeric urlis, banana leaf decor  │
+│ Mehendi      │ Colorful Rajasthani style, cushion seating, phulkari fabrics│
+│ Sangeet      │ Dramatic stage, LED lights, sequin drapes, dance floor      │
+│ Shaadi       │ Mandap with hawan kund, varmala, phoolon ki chadar          │
+│ Reception    │ Crystal chandeliers, round tables, LED name backdrop        │
+└──────────────┴─────────────────────────────────────────────────────────────┘
+
+THEME INTENT MAPPING:
+┌──────────────┬─────────────────────────────────────────────────────────────┐
+│ Theme        │ Visual Language                                             │
+├──────────────┼─────────────────────────────────────────────────────────────┤
+│ Royal        │ Jewel tones, brocade, crystal chandeliers, gold ornate      │
+│ Minimal      │ White/neutral, monochrome florals, glass elements, candles  │
+│ Boho         │ Earthy tones, macrame, pampas grass, rattan, fairy lights   │
+│ Traditional  │ Bright vivid colors, temple pillars, marigold, brass lamps  │
+│ Pastel       │ Blush/lavender/sage, chiffon drapes, delicate fairy lights  │
+│ Art Deco     │ Geometric gold/black, mirrored surfaces, crystal beading    │
+└──────────────┴─────────────────────────────────────────────────────────────┘
+
+CELEBRATION TYPE MAPPING:
+┌────────────────┬───────────────────────────────────────────────────────────┐
+│ Type           │ Venue Context                                             │
+├────────────────┼───────────────────────────────────────────────────────────┤
+│ Palace         │ Marble halls, ornate ceilings, arched doorways, pillars   │
+│ Banquet        │ Large indoor hall, carpeted floors, ceiling for draping   │
+│ Open Lawn      │ Lush grass, open sky, string lights, canopy sections      │
+│ Resort         │ Poolside/garden, tropical setting, covered verandas       │
+│ Beach          │ Sandy shore, ocean backdrop, bamboo, tiki torches         │
+│ Heritage Haveli│ Jharokha windows, courtyard, frescoed walls, lanterns     │
+└────────────────┴───────────────────────────────────────────────────────────┘
+
+TIME OF DAY MAPPING:
+┌──────────────┬─────────────────────────────────────────────────────────────┐
+│ Time         │ Lighting Vibe                                               │
+├──────────────┼─────────────────────────────────────────────────────────────┤
+│ Daytime      │ Bright natural sunlight, pastel tones, fresh airy feel      │
+│ Nighttime    │ Warm golden fairy lights, candles, LED uplighting           │
+│ Golden Hour  │ Amber/orange warmth, long shadows, backlit silhouettes      │
+│ Twilight     │ Purple-blue sky, stars, natural + artificial light blend    │
+└──────────────┴─────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 2: VENUE FORENSIC ANALYSIS (when venue image provided)
+═══════════════════════════════════════════════════════════════════════════════
+
+Examine the VENUE image systematically. Everything documented here is SACRED:
+
+GROUND/FLOOR:
+├─ Material + Exact Color + Texture & Pattern + Reflectivity + Condition
+
+WALLS & VERTICAL SURFACES:
+├─ Material + Exact Color + Architectural Features + Fixed Elements
+├─ Decorative Elements (KEEP ALL) + Background Beyond Walls
+
+CEILING & OVERHEAD:
+├─ Type + Height Estimate + Color & Material + Existing Fixtures
+
+LIGHTING CONDITIONS:
+├─ Primary Source + Direction + Color Temperature + Intensity & Quality
+├─ Shadow Analysis + Shadow Direction + Ambient Fill + Time-of-Day Cues
+
+CAMERA & COMPOSITION:
+├─ Viewpoint Height + Angle + Lens Characteristics + Depth of Field
+
+EXISTING DECOR & FURNITURE:
+├─ List every item + positions → KEEP unless user says to remove
+
+SCALE REFERENCES:
+├─ Use known objects: door≈7ft, paver≈24"×24", pergola post≈9ft, chair≈3ft
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 3: DECOR REFERENCE DEEP EXTRACTION (when decor image provided)
+═══════════════════════════════════════════════════════════════════════════════
+
+Examine the DECOR REFERENCE image — catalog EVERY available element:
+
+PRIMARY STRUCTURE:
+├─ Type + Shape + Estimated Size (height×width ft) + Frame Material + Color
+
+FLORAL ELEMENTS (hyper-specific):
+├─ Species list (roses/peonies/hydrangeas/orchids/dahlias/baby's breath etc.)
+├─ Color per species (e.g., "blush pink garden roses, ivory spray roses")
+├─ Greenery (eucalyptus/fern/ivy/ruscus — specify sub-type)
+├─ Arrangement density per zone: Top/Crown, Left Side, Right Side, Base, Center
+
+FABRIC & DRAPERY:
+├─ Type (chiffon/organza/tulle/silk/satin) + Exact color shade + Opacity
+├─ Draping configuration + Attachment method + Movement quality + Volume
+
+LIGHTING IN DECOR:
+├─ String lights, candles, lanterns, uplighting — list or write NONE
+
+VIBE & ATMOSPHERE EXTRACTION:
+├─ Overall brightness: [dim-moody / soft-medium / bright-airy]
+├─ Glow presence: [no glow / subtle warm glow / strong golden glow]
+├─ Glow source: [fairy lights / candles / uplights / backlit fabric]
+├─ Glow color: [warm amber / soft gold / cool white / pink-rose]
+├─ Bokeh/light orbs: [absent / subtle / prominent dreamy bokeh]
+├─ Color cast: [neutral / warm golden / cool blue / pink-rose]
+├─ Contrast level: [flat-low / medium natural / punchy-high]
+├─ Highlight tone: [pure white / creamy warm / golden / pink-tinted]
+├─ Shadow tone: [true black / warm brown-black / lifted-milky]
+├─ Atmospheric haze: [none / subtle / dreamy fog]
+├─ Petal surface: [matte dry / natural / slightly dewy / wet glistening]
+├─ Fabric surface: [matte / slight sheen / glowing from backlight]
+└─ Emotional energy: [romantic / dramatic / serene / festive / grand]
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 4: SMART ELEMENT SELECTION + ADAPTATION & PROPAGATION
+═══════════════════════════════════════════════════════════════════════════════
+
+Cross-reference User Intent with Decor Inventory to determine the mode:
+
+MODE A: SINGLE OBJECT PLACEMENT (Default)
+├─ User just wants a mandap, arch, or seating area added.
+├─ Keep decor localized to one spot.
+
+MODE B: FULL VENUE TRANSFORMATION (If user asks to "decorate complete hall/venue")
+├─ Extract the visual DNA from the decor reference (colors, flower types, fabrics).
+├─ PROPAGATE this DNA across the entire venue.
+├─ Ceiling: Add hanging floral chandeliers, ceiling draping bridging across.
+├─ Floor/Aisle: Add heavy floral runners matching the decor style down the center aisle.
+├─ Pillars/Walls: Wrap all visible pillars in matching florals and fabric.
+└─ DO NOT just plop a single object. You must flood the space with the decor *style*.
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 5: PHYSICS-BASED INTEGRATION RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+GRAVITY: All objects have believable support/contact points, no floating
+LIGHTING: Shadow direction/softness matches venue, specular highlights correct
+PERSPECTIVE: Follows venue vanishing points, farther=smaller
+MATERIALS: Reflective floors show reflections, translucent fabric shows light
+VIBE TRANSFER: Color grade, glow, bokeh, haze from decor reference applied to full scene
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 6: ACTION-FIRST 4-ZONE PROMPT CONSTRUCTION
+═══════════════════════════════════════════════════════════════════════════════
+
+The FINAL PROMPT must follow this EXACT 4-zone structure as ONE continuous paragraph:
+
+ZONE 1 — DECOR PLACEMENT COMMAND (~70-90 words) [FIRST SENTENCE]:
+If Mode A (Single Object): "Place a [exact decor type] at [position]."
+If Mode B (Full Transformation): "Transform the entire visible hall by propagating a [aesthetic] floral and fabric design throughout the space. Cover the ceiling with [hanging florals/chandeliers], line the center aisle with a thick [floral carpet/runners], and wrap the existing architectural pillars in [matching fabrics/florals]."
+
+ZONE 2 — FULL DECOR DESCRIPTION (~140-180 words):
+If Mode A: Describe the single structure.
+If Mode B: Describe the massive scale of the decor engulfing the room.
+→ Florals: exact species + exact colors + exact greenery + density
+→ Fabric: exact material + exact color shade + opacity + draping
+→ Vibe transfer: lighting, glow, color grade applied to the whole room.
+
+ZONE 3 — VENUE PRESERVATION LOCK (~80-100 words):
+"Every element of the original photograph remains completely identical and
+unmodified: the [NAME EVERY venue element individually with specific
+color/material/texture]. The camera angle, perspective, field of view,
+depth of field, and composition are unchanged."
+
+ZONE 4 — HARD EXCLUSION LIST (~40-60 words):
+"Do not add: [list everything that could be hallucinated]. All decor elements
+are fully visible within the frame with no cropping."
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 7: MANDATORY LANGUAGE RULES
+═══════════════════════════════════════════════════════════════════════════════
+
+ALWAYS USE specific, measurable language:
+✓ "pure white garden roses, blush pink peonies" (NOT "white flowers")
+✓ "semi-sheer ivory organza" (NOT "white fabric")
+✓ "7-foot-tall rounded arch" (NOT "tall arch")
+✓ "warm 2800K amber glow creating circular bokeh orbs" (NOT "warm lights")
+✓ "soft shadows falling camera-left" (NOT "natural shadows")
+✓ "scaled to 65% of ceiling height" (NOT "proportional")
+
+NEVER USE vague adjectives: beautiful/elegant/stunning/gorgeous/amazing
+NEVER ADD elements not in source images or user request
+NEVER start the final prompt with preservation language
+
+═══════════════════════════════════════════════════════════════════════════════
+STAGE 8: FINAL VALIDATION CHECKLIST
+═══════════════════════════════════════════════════════════════════════════════
+
+Before outputting, verify:
+☑ Final prompt starts with "Place a", "Add a", or "Transform the entire"?
+☑ Are you propagating the decor style across the room if requested?
+☑ No preservation language in first 100 words?
+☑ 7+ specific venue elements named for preservation (walls, floor layout)?
+☑ Specific flower species named?
+☑ Shadow direction matches venue?
+☑ Vibe transfer described (glow, color grade, bokeh, atmosphere)?
+☑ Light-to-surface interaction described?
+☑ "No cropping" language present?
+☑ Exclusion list at end?
+☑ Word count 300-400?
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════════════════════════
+
+**VENUE ANALYSIS:**
+• Floor: [description]
+• Walls/Background: [description]
+• Ceiling: [description]
+• Lighting: [source, direction, temperature, shadow behavior]
+• Camera: [angle, height, lens, depth of field]
+• Fixed Elements: [list all architectural features]
+• Existing Items: [any furniture/decor already present]
+• Scale References: [objects with known sizes]
+
+**DECOR EXTRACTION:**
+• Structure: [type, shape, material, color, size]
+• Florals: [species + colors, greenery types, arrangement zones + density]
+• Fabric: [type, color, opacity, draping style]
+• Lighting Elements: [string lights, candles, etc. — or NONE]
+• Vibe: [brightness, glow color/source/spread, color grade, contrast, atmosphere]
+• Style: [aesthetic classification]
+
+**USER INTENT:**
+• Stage: [which stage]
+• Function/Theme/Type/Time: [user selections]
+• Vibe Description: [user's own words]
+• Elements INCLUDED: [list with reason]
+• Elements EXCLUDED: [list with reason]
+• Adaptations needed: [any modifications for venue compatibility]
+
+**INTEGRATION NOTES:**
+• Plan: [Mode A (Single Object) vs Mode B (Full Transformation)]
+• Scale & Propagation: [How decor style expands across ceiling, floor, pillars if Mode B]
+• Lighting Match: [how decor lighting aligns with venue]
+• Vibe Transfer: [color grade, glow, bokeh, haze being applied]
+
+**FINAL PROMPT:**
+
+[Your single ACTION-FIRST optimized paragraph of 300-400 words starting
+with "Place a" or "Transform the entire" — no line breaks, no formatting, no bullet
+points — Zone 1→2→3→4 structure — ready to feed directly into
+Flux-Kontext-Pro]
+`.trim();
+
+// ------------------------------------------------------------------
+// VARIATION MODIFIERS — 4 distinct visual styles per stage
+// ------------------------------------------------------------------
+
+const VARIATION_MODIFIERS = [
+  {
+    label: 'Classic Center',
+    hint: 'centered and symmetrical, frontal view, lush and maximalist, warm golden hour glow with soft bokeh fairy lights',
+  },
+  {
+    label: 'Asymmetric Cascade',
+    hint: 'slightly off-center with cascading florals on one side, moderate density with focused focal clusters, soft diffused daylight with subtle warm undertone',
+  },
+  {
+    label: 'Minimalist Clean',
+    hint: 'centered with generous breathing room on all sides, minimal and airy with negative space, bright even ambient light high-key minimal shadows',
+  },
+  {
+    label: 'Moody Evening',
+    hint: 'centered with dramatic foreground framing, dense lush arrangement, twilight ambient with warm uplighting deep shadow tones amber bokeh orbs',
+  },
+];
+
+// ------------------------------------------------------------------
+// Stage 1 (Groq): Forensic image analysis — factual observation only
+// ------------------------------------------------------------------
+
+const runGroqStage1 = async ({ venueImageBase64, decorImageBase64, userRequest }) => {
+  const instruction = `
+Analyze the provided images with extreme precision. Output ONLY structured data:
+
+VENUE:
+  GROUND: [exact material, color, texture, pattern, condition]
+  WALLS/BACKGROUND: [material, color, architectural features, background scenery]
+  CEILING: [type, height estimate, existing fixtures]
+  LIGHTING: [type, color temperature, key light direction, shadow direction, shadow hardness, time-of-day estimate]
+  CAMERA: [height, angle, distance estimate, lens feel, depth of field]
+  EXISTING_FURNITURE: [list all items with positions — or NONE]
+  SCALE_REFERENCES: [2-3 objects with estimated real-world sizes]
+  OPEN_SPACE: [largest open area description, dimensions, surroundings]
+
+DECOR:
+  TYPE: [arch/mandap/backdrop/gate/other]
+  SHAPE: [square/rounded arch/organic/asymmetric]
+  DIMENSIONS: [estimated height x width in feet]
+  FRAME: [material, color, post count, visibility]
+  FLORALS_SPECIES: [every flower type — garden rose/spray rose/dahlia/peony/hydrangea/orchid/baby's breath/marigold etc.]
+  FLORALS_COLORS: [exact color per species]
+  GREENERY: [type and sub-type]
+  FLORAL_PLACEMENT: [top beam/all sides/corners/cascading/base clusters with density]
+  FABRIC_TYPE: [chiffon/organza/tulle/silk/satin — or NONE]
+  FABRIC_COLOR: [exact shade]
+  FABRIC_STYLE: [vertical panels/swag/waterfall/gathered — or NONE]
+  VIBE_BRIGHTNESS: [dim-moody / soft-medium / bright-airy]
+  VIBE_GLOW_SOURCE: [fairy lights / candles / uplights / backlit fabric / NONE]
+  VIBE_GLOW_COLOR: [warm amber / soft gold / cool white / pink-rose — or NONE]
+  VIBE_BOKEH: [absent / subtle / prominent dreamy bokeh]
+  VIBE_COLOR_CAST: [neutral / warm golden / cool blue / pink-rose]
+  VIBE_CONTRAST: [flat-low / medium natural / punchy-high]
+  VIBE_HAZE: [none / subtle / dreamy fog]
+  ACCESSORIES: [fairy lights/candles/crystals/lanterns — or NONE]
+  DOMINANT_COLORS: [top 3 colors most to least prominent]
+  AESTHETIC: [classic/modern/bohemian/rustic/glamorous/minimalist/maximalist]
+
+USER_REQUEST: "${userRequest}"
+`.trim();
+
+  const content = [];
+  content.push({ type: 'text', text: instruction });
+
+  if (venueImageBase64) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${venueImageBase64}` } });
+  }
+  if (decorImageBase64) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${decorImageBase64}` } });
+  }
+
+  const response = await groq.chat.completions.create({
+    model: GROQ_VISION_MODEL,
+    messages: [{ role: 'user', content }],
+    temperature: 0.05,
+    max_tokens: 1500,
   });
 
+  return response.choices[0].message.content.trim();
+};
+
 // ------------------------------------------------------------------
-// Core: Generate a single image via /images/generations
+// Stage 2 (Groq): Full structured output + action-first prompt
+// Uses SYSTEM_PROMPT + stage1 analysis
 // ------------------------------------------------------------------
 
-const requestGeneration = async (prompt, attempt = 0) => {
-  const client = createAxiosInstance();
+const runGroqStage2 = async ({ stage1Analysis, userRequest, moodboardConfig, variationHint, venueImageBase64, decorImageBase64 }) => {
+  const { functionType, theme, celebrationType, timeOfDay, vibeDescription } = moodboardConfig;
 
-  const payload = {
-    model: INFIP_MODEL,
-    prompt,
-    n: 1,
-    aspect_ratio: 'square',
-    response_format: 'url',
+  const instruction = `
+You have already analyzed the images. Here is your Stage 1 analysis:
+
+--- START STAGE 1 ANALYSIS ---
+${stage1Analysis}
+--- END STAGE 1 ANALYSIS ---
+
+USER SELECTIONS:
+- Stage: ${moodboardConfig.stage}
+- Function: ${functionType || 'Not specified'}
+- Theme: ${theme || 'Not specified'}
+- Celebration Type: ${celebrationType || 'Not specified'}
+- Time of Day: ${timeOfDay || 'Not specified'}
+- Vibe Description: "${vibeDescription || ''}"
+- Variation Style: ${variationHint}
+
+Now produce your FULL output following the OUTPUT FORMAT in your system instructions.
+Include ALL sections: VENUE ANALYSIS, DECOR EXTRACTION, USER INTENT, INTEGRATION NOTES, FINAL PROMPT.
+
+CRITICAL REMINDERS FOR THE FINAL PROMPT:
+- MUST start with "Place a", "Add a", or "Transform the entire" — NEVER "A photorealistic"
+- Zone 1 (~80 words): Placement/Transformation command with venue anchors + ground contact + scale + propagation
+- Zone 2 (~160 words): Full decor description with exact species/materials + vibe transfer (glow, color grade, bokeh, haze, light-to-surface interaction)
+- Zone 3 (~90 words): "Every element of the original photograph remains..." + name every venue element
+- Zone 4 (~50 words): "Do not add:" + comprehensive exclusion list + "no cropping"
+- Total: 300-400 words
+
+Use ONLY information from the images and Stage 1 analysis. Do NOT invent elements.
+`.trim();
+
+  const content = [];
+  content.push({ type: 'text', text: instruction });
+
+  if (venueImageBase64) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${venueImageBase64}` } });
+  }
+  if (decorImageBase64) {
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${decorImageBase64}` } });
+  }
+
+  const response = await groq.chat.completions.create({
+    model: GROQ_VISION_MODEL,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content },
+    ],
+    temperature: 0.15,
+    max_tokens: 3000,
+  });
+
+  return response.choices[0].message.content.trim();
+};
+
+// ------------------------------------------------------------------
+// Stage 3 (Groq): Extract the final prompt from raw output
+// ------------------------------------------------------------------
+
+const extractFinalPrompt = (rawOutput) => {
+  const markers = ['**FINAL PROMPT:**', 'FINAL PROMPT:', '**FINAL PROMPT**', 'FINAL PROMPT'];
+  for (const marker of markers) {
+    const idx = rawOutput.indexOf(marker);
+    if (idx !== -1) {
+      let text = rawOutput.slice(idx + marker.length).trim();
+      text = text.replace(/^["']|["']$/g, '').trim();
+      if (text.length > 50) return text;
+    }
+  }
+  // Fallback: find action-first marker
+  for (const marker of ['Place a ', 'Place an ', 'Add a ', 'Add an ', 'Transform the entire ']) {
+    const idx = rawOutput.indexOf(marker);
+    if (idx !== -1) return rawOutput.slice(idx).trim();
+  }
+  return rawOutput.trim();
+};
+
+// ------------------------------------------------------------------
+// Full 3-stage Groq pipeline → returns refined Flux prompt
+// ------------------------------------------------------------------
+
+const buildFluxPromptViaGroq = async ({ moodboardConfig, variationHint, venueImageBase64, decorImageBase64 }) => {
+  const { functionType, theme, celebrationType, timeOfDay, vibeDescription, stage } = moodboardConfig;
+
+  const userRequest = [
+    stage ? `Stage: ${stage}` : '',
+    functionType ? `Function: ${functionType}` : '',
+    theme ? `Theme: ${theme}` : '',
+    celebrationType ? `Celebration type: ${celebrationType}` : '',
+    timeOfDay ? `Time: ${timeOfDay}` : '',
+    vibeDescription ? `Vibe: ${vibeDescription}` : '',
+    `Variation style: ${variationHint}`,
+  ].filter(Boolean).join('. ');
+
+  // Stage 1 — forensic analysis (only if images provided)
+  let stage1Analysis = `[No images provided] User request: ${userRequest}`;
+  if (venueImageBase64 || decorImageBase64) {
+    logger.debug('Groq Stage 1: forensic analysis');
+    stage1Analysis = await runGroqStage1({ venueImageBase64, decorImageBase64, userRequest });
+    logger.debug('Groq Stage 1 complete', { words: stage1Analysis.split(' ').length });
+  }
+
+  // Stage 2 — full structured output + action-first prompt
+  logger.debug('Groq Stage 2: building prompt');
+  const rawOutput = await runGroqStage2({
+    stage1Analysis,
+    userRequest,
+    moodboardConfig,
+    variationHint,
+    venueImageBase64,
+    decorImageBase64,
+  });
+  logger.debug('Groq Stage 2 complete', { words: rawOutput.split(' ').length });
+
+  // Stage 3 — extract final prompt
+  let finalPrompt = extractFinalPrompt(rawOutput);
+
+  // Fallback: if extraction too short, run focused Stage 2b
+  if (!finalPrompt || finalPrompt.split(' ').length < 100) {
+    logger.warn('Groq Stage 3: weak extraction, running Stage 2b focused pass');
+    const focused = await groq.chat.completions.create({
+      model: GROQ_VISION_MODEL,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: `Based on this analysis:\n${stage1Analysis}\n\nUser request: "${userRequest}"\n\nWrite ONLY the final Flux-Kontext-Pro prompt. No analysis, no headers. Start with "Place a", "Add a", or "Transform the entire". 300-400 words. One continuous paragraph.`,
+        },
+      ],
+      temperature: 0.15,
+      max_tokens: 1000,
+    });
+    finalPrompt = extractFinalPrompt(focused.choices[0].message.content.trim());
+  }
+
+  logger.info('Groq prompt built', { words: finalPrompt.split(' ').length, variation: variationHint });
+  return finalPrompt;
+};
+
+// ------------------------------------------------------------------
+// BFL Flux: Submit prompt + venue image → get request ID
+// ------------------------------------------------------------------
+
+const submitToFlux = async (prompt, venueImageBase64) => {
+  const headers = {
+    'x-key': BFL_API_KEY,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
   };
 
-  try {
-    logger.debug('AI generation request', { prompt: prompt.slice(0, 120), model: INFIP_MODEL, attempt });
+  const payload = {
+    prompt,
+    output_format: 'jpeg',
+    safety_tolerance: 2,
+  };
 
-    const response = await client.post('/images/generations', payload);
-    const { data } = response;
+  // If venue image provided, use Kontext-Pro (image editing mode)
+  if (venueImageBase64) {
+    payload.input_image = venueImageBase64;
+  }
 
-    if (data?.data?.[0]?.url) {
-      logger.info('AI image generated', { url: data.data[0].url });
-      return { immediate: true, url: data.data[0].url };
-    }
-    if (data?.poll_url) {
-      return { immediate: false, poll_url: data.poll_url };
-    }
+  const response = await axios.post(FLUX_SUBMIT_URL, payload, { headers, timeout: 30000 });
 
-    logger.warn('Unexpected generation response', { data: JSON.stringify(data).slice(0, 200) });
-    throw new Error('Unexpected API response structure');
-  } catch (err) {
-    const status = err.response?.status;
-    const detail = err.response?.data?.detail || err.response?.data?.message || '';
-
-    if ([429, 500, 502, 503].includes(status) && attempt < MAX_RETRIES) {
-      const backoff = getBackoffMs(attempt);
-      logger.warn(`AI generation retry (status ${status}) in ${backoff}ms`, { attempt, detail });
-      await sleep(backoff);
-      return requestGeneration(prompt, attempt + 1);
-    }
-
-    logger.error('AI generation failed', { status, detail, message: err.message });
-
+  if (!response.data?.id) {
     throw Object.assign(
-      new Error(`AI generation failed: ${detail || err.message}`),
-      { code: status === 429 ? 'AI_RATE_LIMITED' : 'AI_SERVICE_ERROR' }
+      new Error(`BFL submit failed: ${JSON.stringify(response.data)}`),
+      { code: 'AI_SERVICE_ERROR' }
     );
   }
+
+  return {
+    requestId: response.data.id,
+    pollingUrl: response.data.polling_url || `${FLUX_POLL_BASE}?id=${response.data.id}`,
+  };
 };
 
 // ------------------------------------------------------------------
-// Core: Poll until image is ready
+// BFL Flux: Poll until image is ready
 // ------------------------------------------------------------------
 
-const pollResult = async (pollUrl) => {
-  const client = createAxiosInstance();
-  const deadline = Date.now() + POLL_TIMEOUT_MS;
-  let attempt = 0;
+const pollFluxResult = async (pollingUrl) => {
+  const headers = { 'x-key': BFL_API_KEY, Accept: 'application/json' };
+  const deadline = Date.now() + FLUX_POLL_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
-    try {
-      const response = await client.get(pollUrl);
-      const result = response.data;
+    await sleep(FLUX_POLL_INTERVAL_MS);
 
-      if (result?.data?.[0]?.url) {
-        return result.data[0].url;
+    try {
+      const response = await axios.get(pollingUrl, { headers, timeout: 15000 });
+      const { status, result } = response.data;
+
+      if (status === 'Ready' && result?.sample) {
+        return result.sample;
       }
-      await sleep(POLL_INTERVAL_MS);
-      attempt++;
+
+      if (['Error', 'Failed', 'Content Moderated', 'Request Moderated'].includes(status)) {
+        throw Object.assign(
+          new Error(`BFL generation failed: ${status}`),
+          { code: 'AI_SERVICE_ERROR' }
+        );
+      }
+      // Still pending — keep polling
     } catch (err) {
-      const status = err.response?.status;
-      if ([429, 500, 502, 503].includes(status)) {
-        await sleep(getBackoffMs(Math.min(attempt, 5)));
-        attempt++;
-        continue;
-      }
-      throw Object.assign(new Error('AI polling failed: ' + err.message), { code: 'AI_SERVICE_ERROR' });
+      if (err.code === 'AI_SERVICE_ERROR') throw err;
+      // Network hiccup — keep polling
+      logger.warn('BFL poll network error, retrying', { message: err.message });
     }
   }
 
-  throw Object.assign(new Error('AI generation timed out'), { code: 'AI_TIMEOUT' });
+  throw Object.assign(new Error('BFL generation timed out'), { code: 'AI_TIMEOUT' });
 };
 
 // ------------------------------------------------------------------
-// Public: Generate one image
+// Generate one image: Groq prompt → BFL submit → BFL poll
 // ------------------------------------------------------------------
 
-const generateSingleImage = async (prompt) => {
-  const result = await requestGeneration(prompt);
-  return result.immediate ? result.url : await pollResult(result.poll_url);
+const generateSingleImage = async ({ moodboardConfig, variation, venueImageBase64, decorImageBase64 }) => {
+  // Build prompt via 3-stage Groq pipeline
+  const prompt = await buildFluxPromptViaGroq({
+    moodboardConfig,
+    variationHint: variation.hint,
+    venueImageBase64: venueImageBase64 || null,
+    decorImageBase64: decorImageBase64 || null,
+  });
+
+  // Submit to BFL Flux
+  const { requestId, pollingUrl } = await submitToFlux(prompt, venueImageBase64 || null);
+  logger.info('BFL job submitted', { requestId, variation: variation.label });
+
+  // Poll for result
+  const imageUrl = await pollFluxResult(pollingUrl);
+  logger.info('BFL image ready', { requestId, url: imageUrl, variation: variation.label });
+
+  return {
+    url: imageUrl,
+    label: variation.label,
+  };
 };
 
 // ------------------------------------------------------------------
-// Public: Generate N images for a stage
+// Public: generateImages
+// Generates IMAGES_PER_STAGE images in parallel, one per variation
+//
+// moodboardConfig shape:
+// {
+//   stage: 'entry' | 'lounge' | 'dining' | 'bar' | 'stage',
+//   functionType: 'Haldi' | 'Mehendi' | 'Sangeet' | 'Shaadi' | 'Reception',
+//   theme: 'Royal' | 'Minimal' | 'Boho' | 'Traditional' | 'Pastel' | 'Art Deco',
+//   celebrationType: 'Palace' | 'Banquet' | 'Open Lawn' | 'Resort' | 'Beach' | 'Heritage Haveli',
+//   timeOfDay: 'Daytime' | 'Nighttime' | 'Golden Hour' | 'Twilight',
+//   vibeDescription: string,
+//   venueImageBase64: string | null,   // raw base64, no data: prefix
+//   decorImageBase64: string | null,   // raw base64, no data: prefix
+// }
 // ------------------------------------------------------------------
 
-const generateImages = async (prompt, count = IMAGES_PER_STAGE) => {
-  logger.info('Generating stage images', { count, model: INFIP_MODEL, prompt: prompt.slice(0, 80) });
+const generateImages = async (moodboardConfig, count = IMAGES_PER_STAGE) => {
+  if (!GROQ_API_KEY) throw Object.assign(new Error('GROQ_API_KEY not set'), { code: 'AI_CONFIG_ERROR' });
+  if (!BFL_API_KEY) throw Object.assign(new Error('BFL_API_KEY not set'), { code: 'AI_CONFIG_ERROR' });
 
-  const tasks = Array.from({ length: count }, (_, i) =>
-    generateSingleImage(`${prompt} [variation ${i + 1}]`).catch((err) => {
-      logger.error(`Image ${i + 1} failed`, { error: err.message });
-      return null;
-    })
+  const { venueImageBase64, decorImageBase64 } = moodboardConfig;
+  const variations = VARIATION_MODIFIERS.slice(0, count);
+
+  logger.info('Generating stage images', {
+    stage: moodboardConfig.stage,
+    count: variations.length,
+    hasVenue: !!venueImageBase64,
+    hasDecor: !!decorImageBase64,
+  });
+
+  const tasks = variations.map((variation) =>
+    generateSingleImage({ moodboardConfig, variation, venueImageBase64, decorImageBase64 })
+      .catch((err) => {
+        logger.error(`Image generation failed for variation "${variation.label}"`, { error: err.message });
+        return null;
+      })
   );
 
-  const urls = (await Promise.all(tasks)).filter(Boolean);
+  const results = (await Promise.all(tasks)).filter(Boolean);
 
-  if (urls.length === 0) {
+  if (results.length === 0) {
     throw Object.assign(new Error('All image generations failed'), { code: 'AI_SERVICE_ERROR' });
   }
 
-  logger.info(`Generated ${urls.length}/${count} images`);
-  return urls;
+  logger.info(`Generated ${results.length}/${variations.length} images`, { stage: moodboardConfig.stage });
+
+  // Return array of {url, label} objects
+  return results.map((r) => ({ url: r.url, label: r.label }));
 };
 
 // ------------------------------------------------------------------
-// Detailed Indian wedding function descriptions
+// Public: generateSingleImageDirect
+// For one-off single image generation (used by select-image or preview)
 // ------------------------------------------------------------------
 
-const FUNCTION_DETAILS = {
-  Haldi: 'Haldi ceremony — turmeric ritual with yellow/marigold color palette, brass urlis with turmeric paste and flowers, banana leaf decorations, marigold garlands, low wooden seating (chowkis), floral rangoli on the floor',
-  Mehendi: 'Mehendi ceremony — vibrant colors, Rajasthani/Moroccan style cushion seating, low tables with mehndi cones, colorful drapes, hanging tassels, phulkari fabrics, hookah centerpieces, fairy lights',
-  Sangeet: 'Sangeet night — dance party atmosphere, dramatic stage with LED lights, disco elements, sequin/glitter drapes, cocktail tables, DJ booth, colorful spotlights, dance floor with patterns',
-  Shaadi: 'Indian wedding ceremony (Shaadi) — mandap/wedding altar with heavy floral decorations, fire pit (hawan kund), velvet and brocade drapes, traditional brass elements, garlands (varmala), phoolon ki chadar, seated arrangement for rituals',
-  Reception: 'Wedding reception — grand formal setup, crystal chandeliers, round tables with luxurious centerpieces, stage/sweetheart table for the couple, LED backdrop with couple names, buffet/bar area, elegant dinnerware',
-};
-
-const THEME_DETAILS = {
-  Royal: 'Royal/regal theme — rich jewel tones (deep red, emerald green, gold), heavy brocade and velvet fabrics, ornate gold frames, crystal chandeliers, large floral arrangements with roses and orchids, marble elements',
-  Minimal: 'Minimal/modern theme — clean lines, white and neutral palette with subtle gold accents, monochrome florals (white roses, baby breath), glass/acrylic elements, geometric shapes, candle-heavy lighting, less-is-more approach',
-  Boho: 'Bohemian theme — earthy tones, macrame hangings, pampas grass, dried flowers, wicker/rattan furniture, dreamcatchers, terracotta pots, fairy lights, natural wood elements, relaxed/free-flowing aesthetic',
-  Traditional: 'Traditional Indian theme — bright vivid colors, temple-style gold pillars, traditional brass lamps, marigold and jasmine garlands, banana leaf and mango leaf decorations (torans), rangoli, silk drapes',
-  Pastel: 'Pastel theme — soft dusty rose, blush pink, lavender, sage green, powder blue, peach floral arrangements, chiffon/organza drapes, delicate fairy lights, romantic and dreamy atmosphere',
-  'Art Deco': 'Art Deco theme — geometric patterns, gold and black color scheme, mirrored surfaces, crystal beading, sequin table runners, feather centerpieces, 1920s glamour, metallic finishes',
-};
-
-const CELEBRATION_DETAILS = {
-  Palace: 'Palace/heritage property venue — grand marble halls, high ornate ceilings, arched doorways, pillared corridors, large courtyard, opulent chandeliers, symmetrical architectural elements',
-  Banquet: 'Banquet hall venue — large indoor hall, carpeted floors, controlled lighting, ceiling height for hanging decor, stage area, round/rectangular table setup, air-conditioned indoor space',
-  OpenLawn: 'Open lawn/garden venue — lush green grass, open sky, natural trees as backdrop, string lights across the lawn, tented or canopy-covered sections, outdoor furniture, natural light during day',
-  Resort: 'Resort/hotel venue — poolside or garden area, tropical or landscaped setting, covered verandas, modern architecture with traditional touches, well-lit pathways, water features',
-  Beach: 'Beach venue — sandy shore, ocean backdrop, bamboo and driftwood elements, light flowing fabrics, seashell accents, tiki torches, sunset/sunrise ambiance, natural breezy feel',
-  HeritageHaveli: 'Heritage haveli venue — traditional Rajasthani architecture, jharokha windows, courtyard setting, frescoed walls, ornate wooden doors, stone carvings, antique furniture, lanterns',
-};
-
-const TIME_DETAILS = {
-  Daytime: 'Daytime setting — bright natural sunlight, shadows from outdoor structures, pastel-toned lighting, fresh flowers in full bloom, airy and open feel',
-  Nighttime: 'Nighttime setting — dramatic artificial lighting, warm golden glow from fairy lights and candles, LED uplighting, spotlights on focal points, cozy intimate atmosphere',
-  'Golden Hour': 'Golden hour setting — warm amber/orange sunlight, long soft shadows, backlit elements creating silhouettes, romantic warm glow on all surfaces, magical dreamy quality',
-  Twilight: 'Twilight/dusk setting — purple-blue sky gradient, first stars visible, combination of remaining natural light and artificial warm lights, magical transition atmosphere',
-};
-
-// ------------------------------------------------------------------
-// Public: Build a rich, selection-aware prompt for a stage
-// ------------------------------------------------------------------
-
-const buildStagePrompt = ({
-  basePrompt,
-  colorDirection,
-  stage,
-  functionType,
-  theme,
-  celebrationType,
-  timeOfDay,
-  venueDescription,
-  decorDescription,
-}) => {
-  // Stage-specific context
-  const stageContext = {
-    entry: 'ENTRANCE / ARRIVAL AREA — the very first view guests see when arriving. Show the grand entry gate, welcome arch, pathway with flower arrangements, welcome signage, and entry decorations',
-    lounge: 'LOUNGE / COCKTAIL AREA — relaxed seating area for guests before the main event. Show cocktail tables, comfortable seating arrangements, drinks station, ambient lighting, conversation nooks',
-    dining: 'DINING HALL / RECEPTION AREA — where guests sit and dine. Show beautifully set dining tables with table runners, centerpieces, place settings, chairbacks with fabric/flowers, serving stations',
-    bar: 'BAR / DRINKS STATION — dedicated beverages area. Show styled bar counter, back-bar display, signature drink stations, ice sculpture or drink wall, bar stools, menu boards',
-    stage: 'MAIN STAGE / CEREMONY AREA — the central focal point. Show the main stage or mandap with elaborate backdrop, couple seating, floral columns, dramatic lighting, photo-worthy backdrop',
-  };
-
-  const parts = [];
-
-  // Core instruction
-  parts.push(`Generate a PHOTOREALISTIC interior decoration visualization for the ${stageContext[stage] || stage} of an Indian wedding event.`);
-
-  // Function type (ceremony)
-  if (functionType && FUNCTION_DETAILS[functionType]) {
-    parts.push(`CEREMONY TYPE: ${FUNCTION_DETAILS[functionType]}.`);
-  }
-
-  // Theme
-  if (theme && THEME_DETAILS[theme]) {
-    parts.push(`DESIGN THEME: ${THEME_DETAILS[theme]}.`);
-  }
-
-  // Venue type
-  if (celebrationType && CELEBRATION_DETAILS[celebrationType]) {
-    parts.push(`VENUE TYPE: ${CELEBRATION_DETAILS[celebrationType]}.`);
-  }
-
-  // Time of day
-  if (timeOfDay && TIME_DETAILS[timeOfDay]) {
-    parts.push(`LIGHTING/TIME: ${TIME_DETAILS[timeOfDay]}.`);
-  }
-
-  // User's vibe description
-  if (basePrompt) {
-    parts.push(`USER'S VISION: "${basePrompt}".`);
-  }
-
-  // Color direction
-  if (colorDirection) {
-    parts.push(`COLOR PALETTE: ${colorDirection}.`);
-  }
-
-  // Venue reference context
-  if (venueDescription) {
-    parts.push(`VENUE REFERENCE: ${venueDescription}`);
-  }
-
-  // Decoration reference context
-  if (decorDescription) {
-    parts.push(`DECORATION REFERENCE: ${decorDescription}`);
-  }
-
-  // Quality instructions
-  parts.push(
-    'STYLE: Ultra-realistic interior decoration photography, magazine-quality editorial shot, professional event photography, shallow depth of field, warm inviting lighting. ' +
-    'Show the complete decorated space with furniture, flowers, lighting, fabric, and all decor elements in place. Make it look like a real professionally decorated wedding event space.'
-  );
-
-  return parts.join('\n\n');
+const generateSingleImageDirect = async (moodboardConfig) => {
+  const results = await generateImages(moodboardConfig, 1);
+  return results[0]?.url || null;
 };
 
 module.exports = {
   generateImages,
-  generateSingleImage,
-  pollResult,
-  buildStagePrompt,
+  generateSingleImageDirect,
 };

@@ -240,7 +240,7 @@ const Studio: React.FC = () => {
                 </div>
                 <Button
                   onClick={handleStartGeneration}
-                  disabled={!hasSelections || (user?.credits ?? 0) <= 0 || startingMoodboard}
+                  disabled={!hasSelections || startingMoodboard}
                   size="lg"
                   className="font-body px-8 glass-strong"
                 >
@@ -256,11 +256,7 @@ const Studio: React.FC = () => {
                     </>
                   )}
                 </Button>
-                {(user?.credits ?? 0) <= 0 && (
-                  <p className="text-xs text-destructive font-body">
-                    No credits remaining. Upgrade your plan for more.
-                  </p>
-                )}
+
               </div>
             )}
           </div>

@@ -5,6 +5,34 @@ const { toPublicUrl, deleteFile } = require('../services/upload.service');
 const { success, created, badRequest, notFound, forbidden, serviceUnavailable } = require('../utils/apiResponse');
 const { STAGES, STAGE_ORDER, PLANS, ERROR_CODES, IMAGES_PER_STAGE } = require('../config/constants');
 const logger = require('../utils/logger');
+const fs = require('fs');
+const path = require('path');
+
+// ------------------------------------------------------------------
+// Helper: read an uploaded image file → base64 string
+// ------------------------------------------------------------------
+const fileToBase64 = (filePath) => {
+  try {
+    // filePath could be a public URL like http://localhost:5000/uploads/...
+    // Convert it back to a local path
+    let localPath = filePath;
+    if (localPath.startsWith('http')) {
+      // Strip the base URL prefix to get relative path
+      const baseUrl = process.env.BASE_URL || 'http://localhost:5000';
+      localPath = localPath.replace(baseUrl + '/', '');
+    }
+    // Resolve to absolute path
+    if (!path.isAbsolute(localPath)) {
+      localPath = path.join(process.cwd(), localPath);
+    }
+    if (fs.existsSync(localPath)) {
+      return fs.readFileSync(localPath).toString('base64');
+    }
+  } catch (err) {
+    logger.warn('Failed to read image file for base64 conversion', { filePath, error: err.message });
+  }
+  return null;
+};
 
 // ------------------------------------------------------------------
 // POST /api/moodboard/start
@@ -24,16 +52,6 @@ const startMoodboard = async (req, res, next) => {
       designImageUrl = toPublicUrl(req.files.design[0].path);
     }
 
-    // Build descriptive context for reference images
-    const venueContext = celebrationType || 'wedding venue';
-    const venueDescription = venueImageUrl
-      ? `User uploaded a reference photo of the actual venue. The venue is a ${venueContext} style space. The AI-generated images must visualize how decorations would look INSIDE this specific type of venue — matching its architecture, scale, walls, floor, and ceiling style.`
-      : '';
-
-    const decorDescription = designImageUrl
-      ? `User uploaded a decoration reference photo showing the desired decoration style. The generated images should incorporate this exact decoration aesthetic — the floral arrangements, color palette, fabric draping, lighting fixtures, table settings, and ornament style from the reference.`
-      : '';
-
     const moodboard = await Moodboard.create({
       userId,
       basePrompt: prompt || 'Beautiful wedding decoration',
@@ -44,8 +62,6 @@ const startMoodboard = async (req, res, next) => {
       theme: theme || '',
       celebrationType: celebrationType || '',
       timeOfDay: timeOfDay || '',
-      venueDescription,
-      decorDescription,
     });
 
     logger.info('Moodboard created', { moodboardId: moodboard._id, userId, functionType, theme, celebrationType });
@@ -61,7 +77,17 @@ const startMoodboard = async (req, res, next) => {
 // ------------------------------------------------------------------
 const generateStage = async (req, res, next) => {
   const { id } = req.params;
-  const { stage } = req.body;
+  const {
+    stage,
+    venueImageBase64: bodyVenueBase64,
+    decorImageBase64: bodyDecorBase64,
+    functionType: bodyFunctionType,
+    theme: bodyTheme,
+    celebrationType: bodyCelebrationType,
+    timeOfDay: bodyTimeOfDay,
+    vibeDescription: bodyVibeDescription,
+    prompt: bodyPrompt,
+  } = req.body;
   const user = req.user;
 
   let moodboard;
@@ -88,12 +114,20 @@ const generateStage = async (req, res, next) => {
       });
     }
 
-    // Credit check — entry is always free, others cost 1 credit
-    const isEntryStage = stage === 'entry';
-    const isFirstEntry =
-      isEntryStage && moodboard.stages.entry.images.length === 0;
+    // ── Credit Logic ──
+    // First complete moodboard is FREE (all 5 stages).
+    // Check how many completed moodboards this user has.
+    const completedMoodboardCount = await Moodboard.countDocuments({
+      userId: user._id,
+      status: 'COMPLETED',
+    });
+    const isFirstMoodboard = completedMoodboardCount === 0;
 
-    if (!isFirstEntry) {
+    // Also check: is this current moodboard the user's first in-progress one?
+    // If we already have a completed moodboard, then this generation costs credits.
+    const isFreeGeneration = isFirstMoodboard;
+
+    if (!isFreeGeneration) {
       if (user.plan !== PLANS.PRO_PLUS && user.credits <= 0) {
         return forbidden(
           res,
@@ -110,31 +144,48 @@ const generateStage = async (req, res, next) => {
     moodboard.stages[stage].retryCount = (moodboard.stages[stage].retryCount || 0) + 1;
     await moodboard.save();
 
-    // Build prompt with ALL user selections
-    const stagePrompt = aiService.buildStagePrompt({
-      basePrompt: moodboard.basePrompt,
-      colorDirection: moodboard.colorDirection,
+    // ── Build moodboardConfig for the new AI service ──
+    // Per-stage overrides from request body take priority over global moodboard settings
+    const functionType = bodyFunctionType || moodboard.functionType || '';
+    const theme = bodyTheme || moodboard.theme || '';
+    const celebrationType = bodyCelebrationType || moodboard.celebrationType || '';
+    const timeOfDay = bodyTimeOfDay || moodboard.timeOfDay || '';
+    const vibeDescription = bodyVibeDescription || bodyPrompt || moodboard.basePrompt || '';
+
+    // Get base64 images: prefer per-stage uploads from body, fallback to moodboard-level uploads
+    let venueImageBase64 = bodyVenueBase64 || null;
+    let decorImageBase64 = bodyDecorBase64 || null;
+
+    if (!venueImageBase64 && moodboard.venueImageUrl) {
+      venueImageBase64 = fileToBase64(moodboard.venueImageUrl);
+    }
+    if (!decorImageBase64 && moodboard.designImageUrl) {
+      decorImageBase64 = fileToBase64(moodboard.designImageUrl);
+    }
+
+    const moodboardConfig = {
       stage,
-      functionType: moodboard.functionType,
-      theme: moodboard.theme,
-      celebrationType: moodboard.celebrationType,
-      timeOfDay: moodboard.timeOfDay,
-      venueDescription: moodboard.venueDescription,
-      decorDescription: moodboard.decorDescription,
-    });
+      functionType,
+      theme,
+      celebrationType,
+      timeOfDay,
+      vibeDescription,
+      venueImageBase64,
+      decorImageBase64,
+    };
 
     // Deduct credit (non-free generations)
-    if (!isFirstEntry && user.plan !== PLANS.PRO_PLUS) {
+    if (!isFreeGeneration && user.plan !== PLANS.PRO_PLUS) {
       await User.findByIdAndUpdate(user._id, { $inc: { credits: -1 } });
       logger.info('Credit deducted', { userId: user._id, stage, remaining: user.credits - 1 });
     }
 
-    // Generate images
-    const imageUrls = await aiService.generateImages(stagePrompt, IMAGES_PER_STAGE);
+    // Generate images via Groq + Flux pipeline
+    const generatedImages = await aiService.generateImages(moodboardConfig, IMAGES_PER_STAGE);
 
-    // Save results
-    moodboard.stages[stage].images = imageUrls;
-    moodboard.stages[stage].prompt = stagePrompt;
+    // Save results — generatedImages is [{url, label}, ...]
+    moodboard.stages[stage].images = generatedImages;
+    moodboard.stages[stage].prompt = vibeDescription;
     moodboard.stages[stage].generatedAt = new Date();
     moodboard.stages[stage].status = 'completed';
     moodboard.stages[stage].error = null;
@@ -143,11 +194,11 @@ const generateStage = async (req, res, next) => {
 
     await moodboard.save();
 
-    logger.info('Stage generated', { moodboardId: id, stage, imageCount: imageUrls.length });
+    logger.info('Stage generated', { moodboardId: id, stage, imageCount: generatedImages.length });
 
     return success(res, {
       stage,
-      images: imageUrls,
+      images: generatedImages,
       moodboardId: moodboard._id,
     }, `Stage "${stage}" generated successfully`);
 
@@ -157,8 +208,10 @@ const generateStage = async (req, res, next) => {
       try {
         moodboard.isGenerating = false;
         moodboard.generatingStage = null;
-        moodboard.stages[req.body.stage].status = 'failed';
-        moodboard.stages[req.body.stage].error = err.message;
+        if (moodboard.stages[req.body.stage]) {
+          moodboard.stages[req.body.stage].status = 'failed';
+          moodboard.stages[req.body.stage].error = err.message;
+        }
         await moodboard.save();
       } catch (saveErr) {
         logger.error('Failed to release moodboard lock', { error: saveErr.message });
@@ -173,8 +226,8 @@ const generateStage = async (req, res, next) => {
       });
     }
 
-    if (err.code === 'AI_SERVICE_ERROR' || err.code === 'AI_RATE_LIMITED') {
-      return serviceUnavailable(res, 'AI service is temporarily unavailable. Please try again shortly.');
+    if (err.code === 'AI_SERVICE_ERROR' || err.code === 'AI_RATE_LIMITED' || err.code === 'AI_CONFIG_ERROR') {
+      return serviceUnavailable(res, `AI service error: ${err.message}`);
     }
 
     next(err);
@@ -197,7 +250,12 @@ const selectImage = async (req, res, next) => {
       return badRequest(res, `Stage "${stage}" has not been generated yet.`, ERROR_CODES.INVALID_STAGE);
     }
 
-    if (!stageData.images.includes(imageUrl)) {
+    // Images can be {url, label} objects or plain strings
+    const imageUrls = stageData.images.map((img) =>
+      typeof img === 'string' ? img : img.url
+    );
+
+    if (!imageUrls.includes(imageUrl)) {
       return badRequest(res, 'The selected image URL does not belong to this stage.', ERROR_CODES.INVALID_IMAGE);
     }
 

@@ -40,7 +40,14 @@ const generateStageSchema = Joi.object({
       'any.only': 'Stage must be one of: entry, lounge, dining, bar, stage',
       'any.required': 'Stage is required',
     }),
-  prompt: Joi.string().trim().min(5).max(1000).optional(),
+  prompt: Joi.string().trim().min(3).max(1000).optional().allow(''),
+  venueImageBase64: Joi.string().max(20_000_000).optional().allow('', null),
+  decorImageBase64: Joi.string().max(20_000_000).optional().allow('', null),
+  functionType: Joi.string().trim().max(50).optional().allow(''),
+  theme: Joi.string().trim().max(50).optional().allow(''),
+  celebrationType: Joi.string().trim().max(50).optional().allow(''),
+  timeOfDay: Joi.string().trim().max(50).optional().allow(''),
+  vibeDescription: Joi.string().trim().max(1000).optional().allow(''),
 });
 
 const selectImageSchema = Joi.object({

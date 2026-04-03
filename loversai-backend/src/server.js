@@ -43,8 +43,8 @@ app.use(cors({
 // General Middleware
 // ------------------------------------------------------------------
 app.use(compression());
-app.use(express.json({ limit: '5mb' }));
-app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // HTTP request logging
 app.use(
@@ -128,6 +128,9 @@ const start = async () => {
   server = app.listen(PORT, () => {
     logger.info(`LoversAI API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
   });
+  // Increase server timeout for long AI generation requests (5 min)
+  server.timeout = 300000;
+  server.keepAliveTimeout = 300000;
 
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
